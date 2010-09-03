@@ -1,6 +1,6 @@
 # keepnick - irssi 0.7.98.CVS 
 #
-#    $Id: keepnick.pl,v 1.17 2003/01/04 10:18:42 peder Exp $
+#    $Id: keepnick.pl,v 1.16 2002/10/27 14:55:25 peder Exp $
 #
 # Copyright (C) 2001, 2002 by Peder Stray <peder@ninja.no>
 #
@@ -12,7 +12,7 @@ use Irssi::Irc;
 # ======[ Script Header ]===============================================
 
 use vars qw{$VERSION %IRSSI};
-($VERSION) = '$Revision: 1.17 $' =~ / (\d+\.\d+) /;
+($VERSION) = '$Revision: 1.16 $' =~ / (\d+\.\d+) /;
 %IRSSI = (
           name        => 'keepnick',
           authors     => 'Peder Stray',
@@ -25,6 +25,8 @@ use vars qw{$VERSION %IRSSI};
 # ======[ Variables ]===================================================
 
 my(%keepnick);		# nicks we want to keep
+my(%nickserv);		# nickserv passwords
+my(%nsreq,%nsok,%nsnick,%nshost,%nslast);	#nickserv information
 my(%getnick);		# nicks we are currently waiting for
 my(%inactive);		# inactive chatnets
 my(%manual);		# manual nickchanges
@@ -41,6 +43,79 @@ sub change_nick {
 			     "" => "event empty",
 			    });
     $server->send_raw("NICK :$nick");
+}
+
+sub event_notice {
+    # $data = "nick/#channel :text"
+    my ($server, $data, $nick, $host) = @_;
+    my ($target, $text) = $data =~ /^(\S*)\s:(.*)/;
+    my ($net);
+
+    for my $check (keys %keepnick) {
+	next if $inactive{$check};
+	if (lc $server->{tag} eq lc $check){
+		$net = $check;
+	}
+    }
+
+    if ($net eq ""){
+	server_printformat($server, MSGLEVEL_NICKS | MSGLEVEL_NO_ACT,
+			   'keepnick_no_net', $net);
+	return;
+    }
+    my $altnick = Irssi::settings_get_str("alternate_nick");
+    return if ($text !~ /This nickname (is|has been) (owned|registered)/ &&
+		$text !~ /Password accepted/ &&
+		$text !~ /You have .*identified/);
+    return if ($nick != $nsnick{$net});
+
+    if ($host != $nshost{$net}) {
+	server_printformat($server, MSGLEVEL_NICKS | MSGLEVEL_NO_ACT,
+		'keepnick_hack_attempt', $nick, $host, $target, $text);
+        return;
+    }
+
+    return if ($target !~ /$server->{nick}/);
+
+    if ($text =~ /This nickname (is|has been) (owned|registered)/){
+	if ($nickserv{$net} !~ /^$/){
+		server_printformat($server, MSGLEVEL_NICKS | MSGLEVEL_NO_ACT,
+			'keepnick_req_auth', $nick, $host);
+		if ($nickserv{$net} =~ /^raw:/){
+			my $pass = $nickserv{$net};
+			$pass =~ s/^raw://;
+			$server->send_raw("ns IDENTIFY $keepnick{$net} $pass");
+		} else {
+			$server->send_message("NickServ", "IDENTIFY $nickserv{$net}", 1);
+		}
+	} else {
+		server_printformat($server, MSGLEVEL_NICKS | MSGLEVEL_NO_ACT,
+			'keepnick_req_auth_fail', $nick, $host);
+	}
+    }
+    elsif ($text =~ /You have already.*identified/){
+	    return if (time() - $nslast{$net} < 25);
+	    $nslast{$net} = time();
+	    if ($server->{nick} eq $altnick){
+		    if ($nickserv{$net} =~ /^raw:/){
+			    my $pass = $nickserv{$net};
+			    $pass =~ s/^raw://;
+			    $server->send_raw("ns GHOST $keepnick{$net} $pass");
+		    } else {
+			    $server->send_message("NickServ",
+				"GHOST $keepnick{$net} $nickserv{$net}", 1);
+		    }
+	    }
+    }
+    else {
+	    server_printformat($server, MSGLEVEL_NICKS | MSGLEVEL_NO_ACT,
+		    'keepnick_req_success', $nick, $host);
+	    if ($nick == $altnick){
+		    change_nick($server, $keepnick{$net});
+	    } else {
+		    $server->send_message("ChanServ", "INVITE #gametome.staff", 1);
+	    }
+    }
 }
 
 # --------[ check_nick ]------------------------------------------------
@@ -66,6 +141,29 @@ sub check_nick {
 	if (lc $server->{nick} eq lc $nick) {
 	    delete $getnick{$net};
 	    next;
+	} elsif (lc $server->{nick} == Irssi::settings_get_str("alternate_nick")){
+		Irssi::printformat(MSGLEVEL_CLIENTCRAP, 'keepnick_alternate_auth');
+		if ($nickserv{$net} =~ /^raw:/){
+			my $pass = $nickserv{$net};
+			$pass =~ s/^raw://;
+			$server->send_raw("ns IDENTIFY $keepnick{$net} $pass");
+		} else {
+			$server->send_message("NickServ", "IDENTIFY $nickserv{$net}", 1);
+		}
+	} elsif($nickserv{$net} != "" &&
+		lc $server->{nick} ne lc $keepnick{$net} ) {
+	    server_printformat($server, MSGLEVEL_NICKS | MSGLEVEL_NO_ACT,
+		'keepnick_ghost');
+	    return if (time() - $nslast{$net} < 25);
+	    $nslast{$net} = time();
+	    if ($nickserv{$net} =~ /^raw:/){
+		    my $pass = $nickserv{$net};
+		    $pass =~ s/^raw://;
+		    $server->send_raw("ns GHOST $keepnick{$net} $pass");
+	    } else {
+		    $server->send_message("NickServ",
+			"GHOST $keepnick{$net} $nickserv{$net}", 1);
+	    }
 	}
 	$server->redirect_event('keepnick ison', 1, '', -1, undef,
 				{ "event 303" => "redir keepnick ison" });
@@ -83,9 +181,12 @@ sub load_nicks {
     %keepnick = ();
     open CONF, "< $file";
     while (<CONF>) {
-	my($net,$nick) = split;
+	my($net,$nick,$nspass,$nshost,$nsnick) = split;
 	if ($net && $nick) {
 	    $keepnick{lc $net} = $nick;
+	    $nickserv{lc $net} = $nspass;
+	    $nshost{lc $net} = $nshost;
+	    $nsnick{lc $net} = $nsnick;
 	    $count++;
 	}
     }
@@ -107,7 +208,7 @@ sub save_nicks {
     
     open CONF, "> $file";
     for my $net (sort keys %keepnick) {
-	print CONF "$net\t$keepnick{$net}\n";
+	print CONF "$net\t$keepnick{$net}\t$nickserv{$net}\t$nshost{$net}\t$nsnick{$net}\n";
 	$count++;
     }
     close CONF;
@@ -232,19 +333,32 @@ sub sig_setup_save {
 
 # ======[ Commands ]====================================================
 
+# --------[ KEEPNICK HELP ]---------------------------------------------
+
+sub cmd_print_help {
+  Irssi::print(<<EOF, MSGLEVEL_CRAP);
+   /keepnick [-net <chatnet>] [-nickserv <NSNICK> <NSHOST> <password>] [<nick>]
+   /unkeepnick
+   /listnick
+EOF
+}
 # --------[ KEEPNICK ]--------------------------------------------------
 
-# Usage: /KEEPNICK [-net <chatnet>] [<nick>]
+# Usage: /KEEPNICK [-net <chatnet>] [-nickserv <NSNICK> <NSHOST> <password>] [<nick>]
 sub cmd_keepnick {
     my(@params) = split " ", shift;
     my($server) = @_;
-    my($chatnet,$nick,@opts);
+    my($chatnet,$nick,@opts,$nsnick,$nshost,$nspass);
 
     # parse named parameters from the parameterlist
     while (@params) {
 	my($param) = shift @params;
 	if ($param =~ /^-(chat|irc)?net$/i) {
 	    $chatnet = shift @params;
+	} elsif ($param =~ /^-(nickserv|ns)$/i) {
+	    $nsnick = shift @params;
+	    $nshost = shift @params;
+	    $nspass = shift @params;
 	} elsif ($param =~ /^-/) {
 	    Irssi::print("Unknown parameter $param");
 	} else {
@@ -277,13 +391,6 @@ sub cmd_keepnick {
     $chatnet ||= $server->{chatnet};
     $nick    ||= $server->{nick};
 
-    # check that we really have a chatnet
-    unless ($chatnet) {
-	Irssi::printformat(MSGLEVEL_CLIENTCRAP, 'keepnick_crap',
-			   "Unable to find a chatnet");
-	return;
-    }
-	
     if ($inactive{lc $chatnet}) {
 	delete $inactive{lc $chatnet};
 	Irssi::printformat(MSGLEVEL_CLIENTCRAP, 'keepnick_unhold',
@@ -294,6 +401,9 @@ sub cmd_keepnick {
 		       $chatnet);
 
     $keepnick{lc $chatnet} = $nick;
+    $nickserv{lc $chatnet} = $nspass;
+    $nshost{lc $chatnet} = $nshost;
+    $nsnick{lc $chatnet} = $nsnick;
 
     save_nicks(1);
     check_nick();
@@ -341,12 +451,16 @@ sub cmd_listnick {
 	    Irssi::printformat(MSGLEVEL_CLIENTCRAP, 'keepnick_list_line',
 			       $keepnick{$_},
 			       $net ? $net->{name} : ">$_<",
-			       $inactive{$_}?'inactive':'active');
+			       $inactive{$_}?'inactive':'active',
+			       $nickserv{$_},
+			       $nsnick{$_},
+			       $nshost{$_});
 	}
 	Irssi::printformat(MSGLEVEL_CLIENTCRAP, 'keepnick_list_footer');
     } else {
 	Irssi::printformat(MSGLEVEL_CLIENTCRAP, 'keepnick_list_empty');
     }
+	Irssi::printformat(MSGLEVEL_CLIENTCRAP, 'keepnick_list_header');
 }
 
 # --------[ NICK ]------------------------------------------------------
@@ -369,6 +483,34 @@ Irssi::settings_add_bool('keepnick', 'keepnick_quiet', 0);
 
 Irssi::theme_register(
 [
+ 'keepnick_ghost',
+ '{hilight Keepnick:} Nick is already in use, sending GHOST',
+
+ 'keepnick_req_success',
+ '{hilight Keepnick:} $0!$1 has accepted authentication!',
+
+
+ 'keepnick_req_auth_fail',
+ '{hilight Keepnick:} $0!$1 requested athentication but I don\'t know what to say!',
+
+ 'keepnick_req_auth',
+ '{hilight Keepnick:} $0!$1 requested authentication. sending...',
+
+ 'keepnick_alternate_auth',
+ '{hilight Keepnick:} We have our alternate_nick, trying to auth anyway...',
+
+ 'keepnick_hack_attempt',
+ '{hilight Keepnick:} !!! \'$0\' host is bad, hack attempt? !!!
+{hilight Keepnick:} !!!
+{hilight Keepnick:} !!! sender: \'$0!$1\'
+{hilight Keepnick:} !!! target: \'$2\'
+{hilight Keepnick:} !!! text  : \'$3\'
+{hilight Keepnick:} !!!
+{hilight Keepnick:} !!! \'$0\' host is bad, hack attempt? !!!',
+
+ 'keepnick_no_net',
+ '{hilight Keepnick:} Couldn\'t determine chatnet (now $0)',
+
  'keepnick_crap', 
  '{line_start}{hilight Keepnick:} $0',
 
@@ -391,7 +533,10 @@ Irssi::theme_register(
  '',
 
  'keepnick_list_line', 
- '{line_start}{hilight Keepnick:} Keeping {nick $0} in [$1] ($2)',
+ '{line_start}{hilight Keepnick:} Keeping {nick $0} in [$1] ($2):
+{line_start}{hilight Keepnick:}        Nickserv Pass "$3"
+{line_start}{hilight Keepnick:}        NickServ Name "$4"
+{line_start}{hilight Keepnick:}        NickServ Host "$5"',
 
  'keepnick_list_footer', 
  '',
@@ -413,8 +558,12 @@ Irssi::signal_add('redir keepnick nick', 'sig_redir_keepnick_nick');
 Irssi::signal_add('setup saved', 'sig_setup_save');
 Irssi::signal_add('setup reread', 'sig_setup_reread');
 
+Irssi::signal_add("event notice", "event_notice");
+
 # --------[ Register commands ]-----------------------------------------
 
+Irssi::command_bind("help_keepnick", 'cmd_print_help');
+Irssi::command_bind("keepnick_help", 'cmd_print_help');
 Irssi::command_bind("keepnick", "cmd_keepnick");
 Irssi::command_bind("unkeepnick", "cmd_unkeepnick");
 Irssi::command_bind("listnick", "cmd_listnick");
